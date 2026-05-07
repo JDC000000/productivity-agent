@@ -65,8 +65,54 @@ from .voice import transcribe
 log = logging.getLogger(__name__)
 
 # In-memory store of pending confirmations, keyed by chat_id.
+# After Phase 5, only /undo uses this — complete_task fires immediately.
 # Single-user bot, so this dict is tiny.
 _pending: dict[int, dict[str, Any]] = {}
+
+# Phase 5: per-chat conversation history, alternating user/assistant messages
+# in Anthropic API shape. In-memory only — wiped on bot restart.
+_history: dict[int, list[dict[str, Any]]] = {}
+
+# Phase 5: tool_result blocks waiting to be sent on the NEXT user turn. The
+# Anthropic API requires every tool_use block in an assistant message to be
+# followed IMMEDIATELY by a user message containing the matching tool_result
+# blocks. Since we run tools after Haiku replies (no second API call this turn),
+# we stash the results here and merge them into the next user message's content
+# (text and tool_result blocks can co-exist in a single user message).
+_pending_tool_results: dict[int, list[dict[str, Any]]] = {}
+
+_HISTORY_USER_TURNS = 10  # cap: keep the last N real-user turns + their assistant pairs
+
+
+def _is_real_user_turn(m: dict[str, Any]) -> bool:
+    """A 'real user turn' is a user message containing at least one text block
+    (possibly mixed with tool_result blocks). Pure tool_result-only messages
+    don't count — they're API plumbing, not turns."""
+    if m.get("role") != "user":
+        return False
+    content = m.get("content", "")
+    if isinstance(content, str):
+        return True
+    return any(b.get("type") == "text" for b in content)
+
+
+def _trim_history(messages: list[dict[str, Any]], max_user_turns: int = _HISTORY_USER_TURNS) -> list[dict[str, Any]]:
+    """Slide the window: keep the last N real-user turns + everything after.
+
+    Slices at the cutoff user message so the result starts with role=user.
+    Strips any orphan tool_result blocks from that first message — they'd
+    refer to a tool_use we just cut off, which the API would reject.
+    """
+    user_idxs = [i for i, m in enumerate(messages) if _is_real_user_turn(m)]
+    if len(user_idxs) <= max_user_turns:
+        return messages
+    cutoff = user_idxs[-max_user_turns]
+    first = messages[cutoff]
+    content = first.get("content", "")
+    if isinstance(content, list):
+        cleaned = [b for b in content if b.get("type") != "tool_result"]
+        first = {"role": "user", "content": cleaned if cleaned else first.get("content")}
+    return [first] + messages[cutoff + 1:]
 
 
 def _is_authorized(update: Update) -> bool:
@@ -256,47 +302,41 @@ async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def _process_user_text(
     update: Update, text: str, chat_id: int, via: str
 ) -> None:
-    """Shared pipeline for both text and voice inputs.
+    """Phase 5: conversational pipeline.
 
-    `via` is "text" or "voice" — gets propagated into the audit log so Friday
-    review can see how Jon prefers to interact.
+    1. yes/no check stays separate (only used by /undo after Phase 5).
+    2. Call Haiku with sliding-window history; receive {text_reply, tool_calls}.
+    3. Run each tool call through the executor, write per-tool audit entries
+       (shape unchanged from Phase 3a–3i).
+    4. Update history.
+    5. Send Haiku's text_reply, or stay silent.
     """
-    # 1. Pending confirmation?
+    # 1. Pending confirmation? (only /undo uses this after Phase 5)
     pending = _pending.get(chat_id)
     confirmation = _classify_confirmation(text) if pending is not None else None
     if pending is not None and confirmation is not None:
         _pending.pop(chat_id, None)
-        is_undo = pending.get("kind") == "undo"
         if confirmation == "yes":
-            if is_undo:
-                await _execute_undo_confirmed(update, pending)
-            else:
-                await _execute_confirmed(update, pending)
+            await _execute_undo_confirmed(update, pending)
         else:
-            cancel_intent = (
-                {"name": "undo"} if is_undo else pending.get("intent")
-            )
             log_action(
                 user_input=pending["original_text"],
-                intent=cancel_intent,
+                intent={"name": "undo"},
                 result="canceled",
                 via=pending.get("via", via),
             )
             await update.message.reply_text("Canceled.")
         return
 
-    # 2. Need an Anthropic key for the rest
+    # 2. Need an Anthropic key for the conversational pipeline
     if not ANTHROPIC_API_KEY:
         await update.message.reply_text(
             "Free-text commands need an Anthropic API key.\n"
-            "See PHASE3A-SETUP.md for the 4-step walkthrough.\n\n"
-            f"Echo: {text}"
+            "See PHASE3A-SETUP.md for the 4-step walkthrough."
         )
         return
 
-    # 3. Parse intent (Phase 3e: pass creds so the parser can inject an
-    # open-task snapshot into Haiku's system prompt for numeric/"all"/fuzzy
-    # references). On creds failure we still parse — just without the snapshot.
+    # 3. Typing indicator + creds for the open-task snapshot
     try:
         await update.message.chat.send_action(ChatAction.TYPING)
     except Exception:
@@ -311,51 +351,94 @@ async def _process_user_text(
             exc_info=True,
         )
 
+    # 4. Build this turn's user message. If the prior assistant turn ended
+    # with tool_use blocks, the API requires a tool_result message immediately
+    # after — we stashed those blocks in _pending_tool_results when the tools
+    # ran, and now merge them into this turn's user content (a single user
+    # message can carry both tool_result and text blocks).
+    pending_tr = _pending_tool_results.pop(chat_id, [])
+    if pending_tr:
+        user_msg = {
+            "role": "user",
+            "content": list(pending_tr) + [{"type": "text", "text": text}],
+        }
+    else:
+        user_msg = {"role": "user", "content": text}
+
+    history = list(_history.get(chat_id, []))
+    messages_for_api = history + [user_msg]
+
     try:
-        intent = parse_intent(text, parser_creds)
+        result = parse_intent(messages_for_api, creds=parser_creds)
     except Exception as exc:
-        log.exception("intent parse failed")
-        log_action(
-            user_input=text, intent=None, result="parse_error", error=str(exc), via=via
-        )
+        log.exception("parse failed")
+        log_action(user_input=text, intent=None, result="parse_error", error=str(exc), via=via)
         await update.message.reply_text(f"Couldn't parse that: {type(exc).__name__}: {exc}")
         return
 
-    name = intent["name"]
-    inp = intent.get("input", {})
+    text_reply = result["text_reply"]
+    tool_calls = result["tool_calls"]
+    assistant_message = result["assistant_message"]
 
-    # 4. Route by intent
-    if name == "needs_clarification":
-        await update.message.reply_text(
-            f"{inp.get('interpretation', '')}\n\n"
-            f"{inp.get('question_for_user', 'Could you rephrase?')}"
-        )
-        log_action(user_input=text, intent=intent, result="clarification_asked", via=via)
-        return
+    # 5. Run each tool call. Per-tool audit shape preserved.
+    # Capture each tool's result string for the NEXT turn's tool_result blocks.
+    new_tool_results: list[dict[str, Any]] = []
+    for call in tool_calls:
+        result_str = await _dispatch_tool_call(update, text, via, call)
+        new_tool_results.append({
+            "type": "tool_result",
+            "tool_use_id": call["id"],
+            "content": result_str or "(no result)",
+        })
+
+    # 6. Update history (alternating user/assistant). Stash tool_results for
+    # the next turn so they can be merged into that user message's content.
+    chat_history = _history.setdefault(chat_id, [])
+    chat_history.append(user_msg)
+    chat_history.append(assistant_message)
+    _history[chat_id] = _trim_history(chat_history)
+
+    if new_tool_results:
+        _pending_tool_results[chat_id] = new_tool_results
+
+    # 7. Send Haiku's text reply. Empty text == intentional silence.
+    if text_reply:
+        await update.message.reply_text(text_reply)
+
+
+async def _dispatch_tool_call(
+    update: Update, original_text: str, via: str, call: dict[str, Any]
+) -> str:
+    """Phase 5: run one tool_use call from Haiku, write per-tool audits, and
+    return a result string for the API tool_result block (so Haiku knows what
+    happened on subsequent turns).
+
+    Bot does NOT send a Telegram reply for normal tool successes — Haiku's
+    text_reply (relayed at the end of _process_user_text) is the user-facing
+    message. Errors and no_match conditions get a bot-side reply for safety.
+    """
+    name = call["name"]
 
     if name == "complete_task":
-        await _handle_complete_task(update, text, intent, chat_id, via=via)
-        return
+        return await _execute_complete_immediate(update, original_text, call, via)
 
     if name == "edit_task":
-        await _handle_edit_task(update, text, intent, via=via)
-        return
+        return await _execute_edit_immediate(update, original_text, call, via)
 
-    # 5. Low-stakes: execute immediately (add_task, append_to_brain_dump)
+    # add_task, append_to_brain_dump, query_brain_dump
+    intent_shape = {"name": name, "input": call["input"]}
     try:
         creds = get_credentials()
-        result_msg = execute_intent(intent, creds)
+        result_msg = execute_intent(intent_shape, creds)
     except Exception as exc:
-        log.exception("execute failed")
-        # Phase 3e: add_task can partially succeed in multi-task mode. The
-        # executor leaves a trail on intent['created_records'] so we can still
-        # log the successes as ok before recording the failure.
-        if intent.get("name") == "add_task" and intent.get("created_records"):
-            done = intent["created_records"]
-            total = len(intent.get("input", {}).get("tasks", []))
+        log.exception("execute failed: %s", name)
+        # add_task partial-success handling preserved from Phase 3e.
+        if name == "add_task" and intent_shape.get("created_records"):
+            done = intent_shape["created_records"]
+            total = len(intent_shape.get("input", {}).get("tasks", []))
             for r in done:
                 log_action(
-                    user_input=text,
+                    user_input=original_text,
                     intent={"name": "add_task", "input": r["task_input"]},
                     result="ok",
                     details=r["summary_line"],
@@ -364,8 +447,8 @@ async def _process_user_text(
                     created_task_list_id=r.get("created_task_list_id"),
                 )
             log_action(
-                user_input=text,
-                intent=intent,
+                user_input=original_text,
+                intent=intent_shape,
                 result="error",
                 error=str(exc),
                 details=f"Failed at task {len(done) + 1} of {total}",
@@ -374,20 +457,19 @@ async def _process_user_text(
             await update.message.reply_text(
                 f"Added {len(done)} of {total} before failing: {type(exc).__name__}: {exc}"
             )
-            return
-
+            return f"Partial: added {len(done)} of {total}, then failed: {exc}"
         log_action(
-            user_input=text, intent=intent, result="error", error=str(exc), via=via
+            user_input=original_text, intent=intent_shape, result="error",
+            error=str(exc), via=via,
         )
         await update.message.reply_text(f"Failed: {type(exc).__name__}: {exc}")
-        return
+        return f"Error: {type(exc).__name__}: {exc}"
 
-    # Phase 3e: per-task audit entries for add_task so Friday review counts
-    # each created task, not each multi-add intent.
-    if intent.get("name") == "add_task":
-        for r in intent.get("created_records", []):
+    # Per-task audit entries for add_task (one per created task).
+    if name == "add_task":
+        for r in intent_shape.get("created_records", []):
             log_action(
-                user_input=text,
+                user_input=original_text,
                 intent={"name": "add_task", "input": r["task_input"]},
                 result="ok",
                 details=r["summary_line"],
@@ -396,24 +478,31 @@ async def _process_user_text(
                 created_task_list_id=r.get("created_task_list_id"),
             )
     else:
-        # Phase 3i: query_brain_dump (and other read intents) stash a short
-        # audit summary on intent['_audit_summary'] so the audit log doesn't
-        # capture the full multi-line reply text.
-        audit_details = intent.get("_audit_summary") or result_msg
-        log_action(user_input=text, intent=intent, result="ok", details=audit_details, via=via)
+        # append_to_brain_dump, query_brain_dump — single audit entry.
+        audit_details = intent_shape.get("_audit_summary") or result_msg
+        log_action(
+            user_input=original_text, intent=intent_shape, result="ok",
+            details=audit_details, via=via,
+        )
 
-    await update.message.reply_text(f"[OK] {result_msg}")
+    return result_msg
 
 
-async def _handle_complete_task(
-    update: Update, original_text: str, intent: dict, chat_id: int, via: str
-) -> None:
-    queries_raw = intent.get("input", {}).get("title_queries") or []
-    # Defensive: drop empties, preserve order.
+async def _execute_complete_immediate(
+    update: Update, original_text: str, call: dict[str, Any], via: str
+) -> str:
+    """Phase 5: complete_task fires immediately, no yes/no staging.
+
+    Per-matched-task audit shape preserved exactly from Phase 3d's
+    _execute_confirmed loop so /undo and Friday review keep working.
+
+    Returns a result string for the API tool_result block.
+    """
+    queries_raw = (call.get("input") or {}).get("title_queries") or []
     queries = [q.strip() for q in queries_raw if isinstance(q, str) and q.strip()]
     if not queries:
         await update.message.reply_text("Couldn't tell which task(s) to complete.")
-        return
+        return "Error: no title_queries provided"
 
     try:
         creds = get_credentials()
@@ -421,7 +510,7 @@ async def _handle_complete_task(
     except Exception as exc:
         log.exception("fetch tasks failed")
         await update.message.reply_text(f"Couldn't fetch tasks: {exc}")
-        return
+        return f"Error fetching tasks: {exc}"
 
     matched: list[dict[str, Any]] = []
     unmatched: list[str] = []
@@ -440,53 +529,72 @@ async def _handle_complete_task(
     if not matched:
         log_action(
             user_input=original_text,
-            intent=intent,
+            intent={"name": "complete_task", "input": call["input"]},
             result="no_match",
             details={"unmatched": unmatched},
             via=via,
         )
         bullets = "\n".join(f"  • {q}" for q in unmatched)
-        await update.message.reply_text(
-            f"No open tasks matched:\n{bullets}\n\nTry the exact wording from /brief."
-        )
-        return
+        await update.message.reply_text(f"No open task matched:\n{bullets}")
+        return f"No matches for: {unmatched}"
 
-    _pending[chat_id] = {
-        "original_text": original_text,
-        "intent": {**intent, "matched_tasks": matched},
+    intent_with_matches = {
+        "name": "complete_task",
+        "input": call["input"],
         "matched_tasks": matched,
-        "unmatched": unmatched,
-        "via": via,
     }
+    try:
+        result_msg = execute_intent(intent_with_matches, creds)
+    except Exception as exc:
+        log.exception("complete_task execute failed")
+        log_action(
+            user_input=original_text, intent=intent_with_matches,
+            result="error", error=str(exc), via=via,
+        )
+        await update.message.reply_text(f"Failed: {type(exc).__name__}: {exc}")
+        return f"Error: {type(exc).__name__}: {exc}"
 
-    lines = ["About to complete:"]
-    for i, m in enumerate(matched, 1):
-        lines.append(f"{i}. {m['title']}")
-    if unmatched:
-        lines.append("")
-        for q in unmatched:
-            lines.append(f"No match: '{q}'")
-    lines.append("")
-    lines.append("Yes/no?")
-    await update.message.reply_text("\n".join(lines))
+    # Per-matched-task audit (mirrors Phase 3d _execute_confirmed shape).
+    for m in matched:
+        log_action(
+            user_input=original_text,
+            intent={
+                "name": "complete_task",
+                "input": {"title_query": m.get("query", "")},
+                "matched_task_id": m["id"],
+                "matched_task_list_id": m.get("list_id"),
+            },
+            result="ok",
+            details=f"Completed: {m.get('title', '(untitled)')}",
+            via=via,
+        )
+
+    # Audit unmatched queries separately so Friday review counts each.
+    for q in unmatched:
+        log_action(
+            user_input=original_text,
+            intent={"name": "complete_task", "input": {"title_query": q}},
+            result="no_match",
+            details=f"unmatched: {q!r}",
+            via=via,
+        )
+
+    return result_msg
 
 
-async def _handle_edit_task(
-    update: Update, original_text: str, intent: dict, via: str
-) -> None:
-    """Phase 3g: edits execute immediately (no yes/no), one audit entry per edit.
+async def _execute_edit_immediate(
+    update: Update, original_text: str, call: dict[str, Any], via: str
+) -> str:
+    """Phase 3g+5: edit_task fires immediately. No bot reply on success — Haiku
+    composes the user-facing message. Per-edit audit + before_state preserved.
 
-    For each edit, fuzzy-match against open tasks (snoozed are filtered out by
-    get_open_tasks already). Unmatched queries get a no_match audit entry and
-    appear inline in the reply. Matched ones go through the executor in a
-    single call so partial failure mid-loop still leaves a record trail on
-    intent['edited_records'].
+    Returns a result string for the API tool_result block.
     """
-    edits_in = (intent.get("input") or {}).get("edits") or []
+    edits_in = (call.get("input") or {}).get("edits") or []
     edits = [e for e in edits_in if isinstance(e, dict) and e.get("target_query")]
     if not edits:
         await update.message.reply_text("Couldn't tell which task(s) to edit.")
-        return
+        return "Error: no edits provided"
 
     try:
         creds = get_credentials()
@@ -494,7 +602,7 @@ async def _handle_edit_task(
     except Exception as exc:
         log.exception("fetch tasks failed")
         await update.message.reply_text(f"Couldn't fetch tasks: {exc}")
-        return
+        return f"Error fetching tasks: {exc}"
 
     matched_edits: list[dict[str, Any]] = []
     unmatched: list[str] = []
@@ -509,26 +617,26 @@ async def _handle_edit_task(
     if not matched_edits:
         log_action(
             user_input=original_text,
-            intent=intent,
+            intent={"name": "edit_task", "input": call["input"]},
             result="no_match",
             details={"unmatched": unmatched},
             via=via,
         )
         bullets = "\n".join(f"  • {q}" for q in unmatched)
-        await update.message.reply_text(
-            f"No open tasks matched:\n{bullets}\n\nTry the exact wording from /brief."
-        )
-        return
+        await update.message.reply_text(f"No open task matched:\n{bullets}")
+        return f"No matches for: {unmatched}"
 
-    intent_with_matches = {**intent, "matched_edits": matched_edits}
+    intent_with_matches = {
+        "name": "edit_task",
+        "input": call["input"],
+        "matched_edits": matched_edits,
+    }
 
     try:
         result_msg = execute_intent(intent_with_matches, creds)
     except Exception as exc:
         log.exception("edit execute failed")
-        # Mirror Phase 3e add_task partial-success handling: log per-task
-        # successes already on intent_with_matches['edited_records'], then the
-        # error.
+        # Mirror Phase 3e add_task partial-success handling.
         done = intent_with_matches.get("edited_records") or []
         total = len(matched_edits)
         for r in done:
@@ -547,7 +655,7 @@ async def _handle_edit_task(
             )
         log_action(
             user_input=original_text,
-            intent=intent,
+            intent={"name": "edit_task", "input": call["input"]},
             result="error",
             error=str(exc),
             details=f"Failed at edit {len(done) + 1} of {total}",
@@ -556,9 +664,9 @@ async def _handle_edit_task(
         await update.message.reply_text(
             f"Edited {len(done)} of {total} before failing: {type(exc).__name__}: {exc}"
         )
-        return
+        return f"Partial: edited {len(done)} of {total}, then failed: {exc}"
 
-    # Per-task success audit entries.
+    # Per-edit success audit.
     for r in intent_with_matches.get("edited_records", []):
         log_action(
             user_input=original_text,
@@ -573,9 +681,6 @@ async def _handle_edit_task(
             via=via,
             before_state=r["before_state"],
         )
-
-    # Per-query no_match entries (separate from successes so Friday review
-    # counts each independently).
     for q in unmatched:
         log_action(
             user_input=original_text,
@@ -585,60 +690,7 @@ async def _handle_edit_task(
             via=via,
         )
 
-    reply = result_msg
-    if unmatched:
-        reply += "\n\n" + "\n".join(f"No match: '{q}'" for q in unmatched)
-    await update.message.reply_text(reply)
-
-
-async def _execute_confirmed(update: Update, pending: dict[str, Any]) -> None:
-    via = pending.get("via", "text")
-    intent = pending["intent"]
-    original_text = pending["original_text"]
-
-    try:
-        creds = get_credentials()
-        result_msg = execute_intent(intent, creds)
-    except Exception as exc:
-        log.exception("confirmed execute failed")
-        log_action(
-            user_input=original_text,
-            intent=intent,
-            result="error",
-            error=str(exc),
-            via=via,
-        )
-        await update.message.reply_text(f"Failed: {type(exc).__name__}: {exc}")
-        return
-
-    # Per-task audit entries for complete_task so Friday review's count and
-    # "WHAT SHIPPED" listing stay accurate. Each entry is shaped like a
-    # singular completion (intent.input.title_query) for backwards compat.
-    if intent.get("name") == "complete_task":
-        for m in pending.get("matched_tasks") or []:
-            per_task_intent = {
-                "name": "complete_task",
-                "input": {"title_query": m.get("query", "")},
-                "matched_task_id": m["id"],
-                "matched_task_list_id": m.get("list_id"),
-            }
-            log_action(
-                user_input=original_text,
-                intent=per_task_intent,
-                result="ok",
-                details=f"Completed: {m.get('title', '(untitled)')}",
-                via=via,
-            )
-    else:
-        log_action(
-            user_input=original_text,
-            intent=intent,
-            result="ok",
-            details=result_msg,
-            via=via,
-        )
-
-    await update.message.reply_text(f"[OK] {result_msg}")
+    return result_msg
 
 
 # ---------------- Phase 3f: /undo ----------------
@@ -737,7 +789,8 @@ async def _execute_undo_confirmed(update: Update, pending: dict[str, Any]) -> No
         via=via,
         undid_ts=entry.get("ts"),
     )
-    await update.message.reply_text(f"[OK] {details}")
+    # Phase 5: drop the [OK] prefix; the past-tense detail reads cleanly on its own.
+    await update.message.reply_text(details)
 
 
 # ---------------- Wiring ----------------

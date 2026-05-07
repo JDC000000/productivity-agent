@@ -1,15 +1,20 @@
-"""Intent parser — uses Claude tool-use to convert natural language into a structured intent.
+"""Conversational intent parser (Phase 5).
 
-We use tool_choice={"type": "any"} to force Claude to pick exactly one of:
+Haiku acts as Jon's executive assistant inside Telegram. Each call returns
+EITHER tool calls, OR a plain-text reply, OR both — Jon's bot routes the tool
+calls to the executor and relays the text reply.
+
+Tools available to Haiku (5):
   - add_task
-  - append_to_brain_dump
   - complete_task
   - edit_task
+  - append_to_brain_dump
   - query_brain_dump
-  - needs_clarification
 
-"Ask, don't guess" is implemented by encouraging Claude to call needs_clarification
-whenever the message is ambiguous, rather than guessing.
+needs_clarification was removed — Haiku writes clarifying questions as plain
+text instead. tool_choice is "auto" so Haiku can stay text-only when needed.
+
+History is per-chat, sliding window of the last ~10 user turns, in-memory only.
 """
 from __future__ import annotations
 
@@ -307,122 +312,175 @@ INTENT_TOOLS: list[dict[str, Any]] = [
             },
         },
     },
-    {
-        "name": "needs_clarification",
-        "description": (
-            "Use when the user's intent is unclear or ambiguous. Better to ask than to guess. "
-            "Examples: a single noun with no verb, a vague phrase, or two plausible interpretations."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "interpretation": {
-                    "type": "string",
-                    "description": "Your best-guess paraphrase of what the user might mean.",
-                },
-                "question_for_user": {
-                    "type": "string",
-                    "description": "A short clarifying question (one sentence).",
-                },
-            },
-            "required": ["interpretation", "question_for_user"],
-        },
-    },
 ]
 
 
-SYSTEM_PROMPT = """You are a productivity agent's intent parser.
+SYSTEM_PROMPT = """You are Jon's executive assistant inside Telegram.
 
 Today is {today} ({weekday}), timezone {tz}.{open_tasks_section}
 
-Your job: pick exactly ONE of the four tools and fill it in based on the user's message.
+You can do FIVE things by calling tools, plus reply in text:
+  - add_task              create one or more Google Tasks
+  - complete_task         mark one or more open tasks done
+  - edit_task             rename / reschedule / re-impact / tag / snooze
+  - append_to_brain_dump  capture a thought into the Brain Dump doc
+  - query_brain_dump      recall recent dump entries (newest first)
 
-Routing rules:
-- "add a task to X" / "remind me to X" / "I should X" / "todo: X"  -> add_task
-- "X is done" / "mark X complete" / "finished X" / "done with X"   -> complete_task
-- "push / reschedule / rename / bump / snooze / tag X"             -> edit_task
-- "note that X" / "thinking about X" / longer brain-dumps          -> append_to_brain_dump
-- "what did I dump" / "show recent dumps" / "find dumps about X"   -> query_brain_dump
-- ambiguous / single noun / no clear verb                          -> needs_clarification
+You may call zero, one, or several tools per turn AND reply in text. Tools
+execute in the order you call them. Text-only replies (no tool call) are right
+when you need to clarify, confirm understanding, or react conversationally.
 
-Multi-task completion:
-complete_task takes title_queries as a LIST. When the user lists multiple things
-to complete in one message, split them into separate entries. Examples:
+VOICE AND TONE
+- Founder-to-EA. Warm but dry. Observant. Comfortable with silence.
+- Brevity is respect. ONE LINE is the default. Two lines if there's a real
+  choice to surface. Three almost never.
+- Never chirpy. No "Of course!", "I'd be happy to", "Great question!". No
+  exclamation marks.
+- Refer to tasks by name in normal sentence case ("buy milk", "the deck"),
+  not as quoted strings or [bracketed metadata].
+- Don't say "[OK]" or "Successfully" or repeat the structured input
+  ("Added task: Buy milk (due 2026-05-08) [impact:3]").
+- For obvious actions, an empty text reply is fine — the user can see what
+  changed; no need to narrate.
+
+GOOD REPLIES (model these):
+  user: add buy milk for thursday
+    → tool: add_task; text: "Added — buy milk for Thursday."
+  user: mark the gym task done and note that I'm starting deep work
+    → tools: [complete_task, append_to_brain_dump]; text: "Done. Deep work noted."
+  user: do the Whistler thing
+    → no tool; text: "Complete the Whistler call task or add a new one?"
+  user: rename buy milk to oat milk
+    → tool: edit_task; text: "Renamed — oat milk."
+  user: thanks
+    → no tool; text: "Sure."
+
+BAD REPLIES (do not produce):
+  "[OK] Added task: Buy milk (due 2026-05-08) [impact:3]"
+  "Successfully added the new task to your list!"
+  "Of course! I'd be happy to do that for you."
+  Any reply containing "!"
+
+ROUTING
+- "add / remind me / I should / todo"               -> add_task
+- "X is done / mark X done / finished X"            -> complete_task
+- "push / reschedule / rename / bump / snooze / tag"-> edit_task
+- "note that / thinking about / brain-dumping"      -> append_to_brain_dump
+- "what did I dump / show recent dumps / find X"    -> query_brain_dump
+- ambiguous / single noun / no clear verb           -> NO tool, text-only question
+
+CLARIFICATION (no longer a tool)
+When the user's intent isn't clear, write a short plain-text question. Don't
+preface with "I'm not sure" — just ask.
+  user: dragon
+    → "Add a task, note an idea, or something else?"
+  user: do the Whistler thing
+    → "Complete the Whistler call task or add a new one?"
+
+CONTINUITY
+The conversation history shows your prior turns including the tool_use inputs
+you emitted. If the user follows up with "actually make it oat milk" right
+after you added "Buy milk", that means edit_task on the buy milk task — read
+the prior tool_use input for the title to use as target_query.
+
+MULTI-TASK COMPLETION
+complete_task takes title_queries as a LIST. Split multi-target requests:
 - "done with the deck and the budget"             -> ["deck", "budget"]
 - "X, Y, and Z are all complete"                  -> ["X", "Y", "Z"]
-- "mark these complete: call Alex, send invoice"  -> ["call Alex", "send invoice"]
-- "finished the pitch deck"                       -> ["pitch deck"]   (1-element list)
+- "finished the pitch deck"                       -> ["pitch deck"]   (1-element)
 Single-task input always uses a 1-element list, never a bare string.
 
-Multi-task add:
-add_task takes a "tasks" LIST. When the user mentions multiple things to add in
-one message, split them into separate entries. Each entry gets its own due date
-resolved independently — "tomorrow" attached to one task doesn't apply to others
-unless the user said so.
+MULTI-TASK ADD
+add_task takes a "tasks" LIST. Split multi-target requests:
 - "add buy milk and call Lisa"                       -> 2 tasks
-- "remind me to email Whistler tomorrow"             -> 1 task (1-element list)
-- "add three: deck draft, expense report, gym"       -> 3 tasks
+- "remind me to email Whistler tomorrow"             -> 1 task (1-element)
 - "add finalize pitch deck (high impact, racecraft)" -> 1 task with impact=5, racecraft=true
-Single-task input always uses a 1-element list, never a bare object.
+Each task's due date is resolved independently — "tomorrow" attached to one
+task doesn't apply to others unless the user said so.
 
-Editing tasks:
-edit_task takes an "edits" LIST. Each edit targets ONE task and sets any subset
-of these optional fields: new_title, new_due, new_impact, new_racecraft,
-snooze_until. Set ONLY the fields the user mentioned — others stay None. At
-least one edit field per edit.
+EDITING TASKS
+edit_task takes an "edits" LIST. Each edit targets ONE task and sets any
+subset of new_title, new_due, new_impact, new_racecraft, snooze_until. Set
+ONLY the fields the user mentioned. At least one edit field per edit.
 - "push the Whistler email to next Tuesday"   -> [{{target_query: "...", new_due: <Tue ISO>}}]
 - "rename buy milk to buy oat milk"           -> [{{target_query: "Buy milk", new_title: "Buy oat milk"}}]
 - "bump the deck to impact 5"                 -> [{{target_query: "...deck...", new_impact: 5}}]
 - "tag the Whistler call as racecraft"        -> [{{target_query: "...", new_racecraft: true}}]
 - "snooze gym until Friday"                   -> [{{target_query: "...gym...", snooze_until: <Fri ISO>}}]
 - "push X and Y to Tuesday"                   -> 2 edits, same new_due
-- "rename A to B and bump impact to 5"        -> 1 edit with BOTH new_title and new_impact
-Single-edit input always uses a 1-element list, never a bare object.
-target_query follows the same snapshot-verbatim rule as complete_task: when an
-open-tasks list is shown above, copy the matching title exactly so downstream
-fuzzy-matching is trivial.
-Snoozed tasks (with a future snoozed_until in their notes) do NOT appear in the
-snapshot. If the user asks to unsnooze something you can't see, prefer
-needs_clarification.
+- "rename A to B and bump impact to 5"        -> 1 edit with BOTH fields
+target_query follows the snapshot-verbatim rule: copy the matching title
+exactly from the open-tasks list above so downstream fuzzy-matching is trivial.
+Snoozed tasks don't appear in the snapshot — if the user asks to unsnooze
+something you can't see, ask in text.
 
-Resolving completions:
-When a "Currently open tasks" list is shown above, treat it as your source of truth.
-- Numeric references ("1, 3 done", "complete 2 and 4")
-    -> look up those numbers in the list, emit title_queries = the resolved titles
-- "all open done" / "everything complete" / "all of those are done"
-    -> emit title_queries = every title in the list
-- Fuzzy / partial / Whisper-garbled references ("the milk thing", "by milk", "whistler one")
-    -> fuzzy-match against the listed titles, emit the closest title verbatim
-- If a number is out of range or nothing fuzzy-matches, prefer needs_clarification.
-- Always emit titles copied from the list, not the user's raw words. This makes
-  downstream matching trivial.
-If no list is shown, just echo the user's words into title_queries; downstream
-code will fuzzy-match.
+RESOLVING COMPLETIONS
+When a "Currently open tasks" list is shown above, treat it as truth.
+- Numeric refs ("1, 3 done")           -> look up those numbers, emit titles
+- "all open done"                       -> emit every title in the list
+- Fuzzy / Whisper-garbled refs          -> fuzzy-match, emit the closest title verbatim
+- Number out of range / no fuzzy hit    -> ask in text instead
+- Always emit titles copied from the list, not the user's raw words.
 
-Querying brain dump:
-query_brain_dump returns the most recent entries from the Active section of the
-Brain Dump doc (newest first). Both inputs are optional.
-- "what did I dump"                          -> no args (uses default limit 10)
-- "show my last 20 brain dump entries"       -> limit=20
-- "find brain dump entries about whistler"   -> keyword="whistler"
-- "show recent dumps about pricing"          -> keyword="pricing"
-- "show 5 recent dumps about racecraft"      -> limit=5, keyword="racecraft"
-The doc isn't timestamped, so temporal qualifiers like "last week", "yesterday",
-"recent" are NOT supported. Drop them and use limit/keyword. If the user only
-specified a temporal qualifier with no keyword and no count, prefer
-needs_clarification to ask what topic or how many entries they want.
+QUERYING BRAIN DUMP
+query_brain_dump returns the most recent entries (newest first). Both inputs
+are optional.
+- "what did I dump"                       -> no args (default limit 10)
+- "show my last 20 brain dump entries"    -> limit=20
+- "find brain dump entries about pricing" -> keyword="pricing"
+- "show 5 recent dumps about racecraft"   -> limit=5, keyword="racecraft"
+The doc isn't timestamped — temporal qualifiers ("last week", "recent") are
+NOT supported. Drop them and use limit/keyword. If the user only specified a
+date qualifier with no topic and no count, ask in text what they want.
 
-Date conversion:
+DATES
 - "tomorrow" -> {tomorrow}
 - "Friday", "next Tuesday", etc -> compute the actual ISO date
 - "in two weeks" -> add 14 days
 
-When unsure, prefer needs_clarification over guessing. The user prefers being asked over being wrong.
+CONTEXT JON EXPECTS YOU TO REMEMBER
+- RaceCraft is the 2026 priority bet (50% of his time). Tasks tagged
+  #racecraft matter most.
+- No meetings before 9am or after 2pm. Max 3 meetings/day.
+- Brain dump is for unprocessed thoughts. Tasks belong in Google Tasks.
+
+When unsure, ask in text rather than guess.
 """
 
 
-def parse_intent(user_text: str, creds=None) -> dict[str, Any]:
-    """Return {'name': str, 'input': dict} for the chosen tool.
+def _coerce_assistant_content(response_content) -> list[dict[str, Any]]:
+    """Convert anthropic SDK content blocks into JSON-safe dicts for history."""
+    out: list[dict[str, Any]] = []
+    for b in response_content:
+        if b.type == "text":
+            out.append({"type": "text", "text": b.text})
+        elif b.type == "tool_use":
+            out.append({
+                "type": "tool_use",
+                "id": b.id,
+                "name": b.name,
+                "input": dict(b.input),
+            })
+    return out
+
+
+def parse_intent(
+    messages: list[dict[str, Any]],
+    creds=None,
+) -> dict[str, Any]:
+    """Phase 5: conversational parse.
+
+    Caller passes the full Anthropic-API-shaped messages list, including the
+    current user turn as the last entry. The bot is responsible for merging
+    any prior turn's tool_result blocks into that user message's content (the
+    API requires tool_result to immediately follow tool_use).
+
+    Returns:
+      {
+        "text_reply":        str,           # Haiku's prose (may be '')
+        "tool_calls":        list[dict],    # [{id, name, input}, ...] (may be [])
+        "assistant_message": dict,          # {role: "assistant", content: [...]} for history
+      }
 
     If creds is provided, a snapshot of currently-open Google Tasks is spliced
     into the system prompt so Haiku can resolve numeric references, "all open"
@@ -437,8 +495,7 @@ def parse_intent(user_text: str, creds=None) -> dict[str, Any]:
 
     tz = ZoneInfo(TIMEZONE)
     today_local = datetime.now(tz).date()
-    tomorrow = (today_local.toordinal() + 1)
-    tomorrow_iso = date.fromordinal(tomorrow).isoformat()
+    tomorrow_iso = date.fromordinal(today_local.toordinal() + 1).isoformat()
 
     system = SYSTEM_PROMPT.format(
         today=today_local.isoformat(),
@@ -450,18 +507,35 @@ def parse_intent(user_text: str, creds=None) -> dict[str, Any]:
 
     response = client.messages.create(
         model=MODEL,
-        max_tokens=400,
+        max_tokens=600,
         system=system,
         tools=INTENT_TOOLS,
-        tool_choice={"type": "any"},
-        messages=[{"role": "user", "content": user_text}],
+        tool_choice={"type": "auto"},
+        messages=messages,
     )
 
-    for block in response.content:
-        if block.type == "tool_use":
-            log.info("parsed intent: %s input=%s", block.name, block.input)
-            return {"name": block.name, "input": dict(block.input)}
+    assistant_content = _coerce_assistant_content(response.content)
 
-    raise RuntimeError(
-        f"Claude didn't call a tool. stop_reason={response.stop_reason} content={response.content}"
+    text_reply = "\n".join(
+        b["text"].strip() for b in assistant_content if b["type"] == "text"
+    ).strip()
+
+    tool_calls = [
+        {"id": b["id"], "name": b["name"], "input": b["input"]}
+        for b in assistant_content
+        if b["type"] == "tool_use"
+    ]
+
+    log.info(
+        "parsed: text=%r tools=%s",
+        text_reply[:80],
+        [(t["name"], list(t["input"].keys())) for t in tool_calls],
     )
+
+    return {
+        "text_reply": text_reply,
+        "tool_calls": tool_calls,
+        "assistant_message": {"role": "assistant", "content": assistant_content},
+    }
+
+
