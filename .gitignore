@@ -1,0 +1,29 @@
+# Secrets — never commit these
+.env
+*.env
+!.env.example
+credentials.json
+token.json
+**/secrets/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Local state
+*.sqlite
+*.db
+logs/
+*.log
+
+# macOS cruft
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp

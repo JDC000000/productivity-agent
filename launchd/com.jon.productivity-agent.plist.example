@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for launchd. Don't edit by hand — run install-launchd.sh
+  which substitutes PRODUCTIVITY_AGENT_DIR and HOME_DIR with real paths,
+  copies to ~/Library/LaunchAgents/, and loads it.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jon.productivity-agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>PRODUCTIVITY_AGENT_DIR/run.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>PRODUCTIVITY_AGENT_DIR</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Wait 30s between restart attempts so we don't spin on a config error. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>HOME_DIR/.productivity-agent/logs/launchd.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>HOME_DIR/.productivity-agent/logs/launchd.stderr.log</string>
+
+    <!-- Inherit a normal user PATH so brew-installed Python is findable. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
