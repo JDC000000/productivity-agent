@@ -305,19 +305,33 @@ def munge_notes(
     return "\n".join(out_lines)
 
 
-def find_best_match(query: str, tasks: list[dict[str, Any]]) -> dict[str, Any] | None:
+def find_best_match(
+    query: str,
+    tasks: list[dict[str, Any]],
+    seen_ids: set[str] | None = None,
+) -> dict[str, Any] | None:
     """Two-tier fuzzy match: exact substring first, then word-overlap.
 
-    Returns the best match or None. Caller is expected to confirm with the user
-    before completing — this is a best-guess, not a certainty.
+    Returns the best match or None.
+
+    Phase 5.1: pass `seen_ids` (a set of already-matched task IDs) when looping
+    over multiple queries in one batch — Tier-1 returns the first hit and
+    without dedup, "complete buy milk" × 3 against 3 actual duplicates collapses
+    to 3× the same task. With seen_ids, each iteration excludes prior matches.
     """
     if not tasks:
+        return None
+
+    candidates = (
+        tasks if not seen_ids else [t for t in tasks if t.get("id") not in seen_ids]
+    )
+    if not candidates:
         return None
 
     q = query.lower().strip()
 
     # Tier 1: exact substring (most specific)
-    for t in tasks:
+    for t in candidates:
         title = (t.get("title", "") or "").lower()
         if q and q in title:
             return t
@@ -328,7 +342,7 @@ def find_best_match(query: str, tasks: list[dict[str, Any]]) -> dict[str, Any] |
         return None
     best: dict[str, Any] | None = None
     best_overlap = 0
-    for t in tasks:
+    for t in candidates:
         title = (t.get("title", "") or "").lower()
         overlap = len(q_words & set(title.split()))
         if overlap > best_overlap:

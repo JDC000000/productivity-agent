@@ -514,9 +514,11 @@ async def _execute_complete_immediate(
 
     matched: list[dict[str, Any]] = []
     unmatched: list[str] = []
+    seen_ids: set[str] = set()  # Phase 5.1: dedupe within a multi-query batch
     for q in queries:
-        m = find_best_match(q, tasks)
+        m = find_best_match(q, tasks, seen_ids=seen_ids)
         if m:
+            seen_ids.add(m["id"])
             matched.append({
                 "id": m["id"],
                 "list_id": m.get("_list_id"),
@@ -606,10 +608,12 @@ async def _execute_edit_immediate(
 
     matched_edits: list[dict[str, Any]] = []
     unmatched: list[str] = []
+    seen_ids: set[str] = set()  # Phase 5.1: dedupe within a multi-edit batch
     for e in edits:
         q = e.get("target_query", "").strip()
-        m = find_best_match(q, tasks)
+        m = find_best_match(q, tasks, seen_ids=seen_ids)
         if m:
+            seen_ids.add(m["id"])
             matched_edits.append({"task": m, "edit": e})
         else:
             unmatched.append(q)
