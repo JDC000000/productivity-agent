@@ -54,7 +54,7 @@ from .data_sources.tasks import (
     reopen_task_by_id,
 )
 from .friday_review import build_friday_review
-from .google_auth import get_credentials
+from .google_auth import build_consent_url, complete_consent, get_credentials
 from .intents.audit import log_action
 from .intents.executor import execute_intent
 from .intents.parser import parse_intent
@@ -80,6 +80,12 @@ _history: dict[int, list[dict[str, Any]]] = {}
 # we stash the results here and merge them into the next user message's content
 # (text and tool_result blocks can co-exist in a single user message).
 _pending_tool_results: dict[int, list[dict[str, Any]]] = {}
+
+# Phase 3c: per-chat stash of the OAuth flow object between /reauth (which
+# generates the consent URL) and the user pasting back the code/URL. The flow
+# holds PKCE state (code_verifier) so the SAME instance must be reused for
+# fetch_token to succeed. Cleared on completion or on a fresh /reauth.
+_reauth_pending: dict[int, Any] = {}
 
 _HISTORY_USER_TURNS = 10  # cap: keep the last N real-user turns + their assistant pairs
 
@@ -119,6 +125,59 @@ def _is_authorized(update: Update) -> bool:
     if TELEGRAM_ALLOWED_CHAT_ID is None:
         return True
     return update.effective_chat.id == TELEGRAM_ALLOWED_CHAT_ID
+
+
+# ---------------- Phase 3c: invalid_grant detector + /reauth helpers ----------------
+
+def _is_auth_error(exc: Exception) -> bool:
+    """True if `exc` means 'Google token expired / revoked'.
+
+    Catches:
+      - google.auth.exceptions.RefreshError (the actual `invalid_grant` case)
+      - googleapiclient.errors.HttpError with status 401
+      - get_credentials()'s custom RuntimeError when token.json is missing/invalid
+    """
+    from google.auth.exceptions import RefreshError
+    from googleapiclient.errors import HttpError
+
+    if isinstance(exc, RefreshError):
+        return True
+    if isinstance(exc, HttpError):
+        status = (
+            getattr(getattr(exc, "resp", None), "status", None)
+            or getattr(exc, "status_code", None)
+        )
+        if status == 401:
+            return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc)
+        if "Google credentials invalid" in msg or "No Google token" in msg:
+            return True
+    return False
+
+
+async def _maybe_notify_reauth(update: Update, exc: Exception) -> bool:
+    """If exc is an auth error, send the Bobnet-style /reauth prompt and
+    return True. Caller falls back to its own error reply when this returns False.
+    """
+    if _is_auth_error(exc):
+        await update.message.reply_text("Token expired. Send /reauth to refresh.")
+        return True
+    return False
+
+
+def _looks_like_oauth_code(text: str) -> bool:
+    """Heuristic to distinguish 'user pasted their OAuth code' from 'user is
+    typing normally and forgot they ran /reauth'. Avoids the footgun where a
+    stray free-text message gets fed to fetch_token and errors confusingly.
+    """
+    t = text.strip()
+    if t.startswith("http") and "code=" in t:
+        return True
+    # Google authorization codes start with "4/" and are long base64-ish strings.
+    if t.startswith("4/") and len(t) > 20:
+        return True
+    return False
 
 
 # ---------------- Phase 1 handlers ----------------
@@ -187,13 +246,13 @@ async def brief(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(msg)
     except Exception as exc:
         log.exception("brief failed")
-        await update.message.reply_text(
-            f"Brief failed: {type(exc).__name__}: {exc}\n\n"
-            "Common causes:\n"
-            "• Run setup first:  ./.venv/bin/python -m src.google_auth setup\n"
-            "• Set BRAIN_DUMP_DOC_ID in .env\n"
-            "• Check ~/.productivity-agent/logs/agent.log for details"
-        )
+        if not await _maybe_notify_reauth(update, exc):
+            await update.message.reply_text(
+                f"Brief failed: {type(exc).__name__}: {exc}\n\n"
+                "Common causes:\n"
+                "• Set BRAIN_DUMP_DOC_ID in .env\n"
+                "• Check ~/.productivity-agent/logs/agent.log for details"
+            )
 
 
 async def review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -238,7 +297,12 @@ def _classify_confirmation(text: str) -> str | None:
 
 
 async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Free text → intent → action. Or yes/no → confirm a pending action."""
+    """Free text → intent → action. Or yes/no → confirm a pending action.
+
+    Phase 3c: if the user just ran /reauth and pastes back something that looks
+    like an OAuth code or redirect URL, intercept BEFORE the conversational
+    pipeline so we don't feed an auth code into Haiku.
+    """
     if not _is_authorized(update):
         log.warning(
             "Rejected message from unauthorized chat_id=%s text=%r",
@@ -249,6 +313,15 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     text = (update.message.text or "").strip()
     chat_id = update.effective_chat.id
+
+    # Phase 3c: re-auth code intake takes priority. If the stashed flow exists
+    # and the message looks like an OAuth code/URL, complete the handshake.
+    # If the message doesn't look like a code, fall through — the user can
+    # retry the paste, run /reauth again to reset, or just abandon.
+    if chat_id in _reauth_pending and _looks_like_oauth_code(text):
+        await _handle_reauth_code(update, text, chat_id)
+        return
+
     await _process_user_text(update, text, chat_id, via="text")
 
 
@@ -462,7 +535,8 @@ async def _dispatch_tool_call(
             user_input=original_text, intent=intent_shape, result="error",
             error=str(exc), via=via,
         )
-        await update.message.reply_text(f"Failed: {type(exc).__name__}: {exc}")
+        if not await _maybe_notify_reauth(update, exc):
+            await update.message.reply_text(f"Failed: {type(exc).__name__}: {exc}")
         return f"Error: {type(exc).__name__}: {exc}"
 
     # Per-task audit entries for add_task (one per created task).
@@ -509,7 +583,8 @@ async def _execute_complete_immediate(
         tasks = get_open_tasks(creds)
     except Exception as exc:
         log.exception("fetch tasks failed")
-        await update.message.reply_text(f"Couldn't fetch tasks: {exc}")
+        if not await _maybe_notify_reauth(update, exc):
+            await update.message.reply_text(f"Couldn't fetch tasks: {exc}")
         return f"Error fetching tasks: {exc}"
 
     matched: list[dict[str, Any]] = []
@@ -553,7 +628,8 @@ async def _execute_complete_immediate(
             user_input=original_text, intent=intent_with_matches,
             result="error", error=str(exc), via=via,
         )
-        await update.message.reply_text(f"Failed: {type(exc).__name__}: {exc}")
+        if not await _maybe_notify_reauth(update, exc):
+            await update.message.reply_text(f"Failed: {type(exc).__name__}: {exc}")
         return f"Error: {type(exc).__name__}: {exc}"
 
     # Per-matched-task audit (mirrors Phase 3d _execute_confirmed shape).
@@ -603,7 +679,8 @@ async def _execute_edit_immediate(
         tasks = get_open_tasks(creds)
     except Exception as exc:
         log.exception("fetch tasks failed")
-        await update.message.reply_text(f"Couldn't fetch tasks: {exc}")
+        if not await _maybe_notify_reauth(update, exc):
+            await update.message.reply_text(f"Couldn't fetch tasks: {exc}")
         return f"Error fetching tasks: {exc}"
 
     matched_edits: list[dict[str, Any]] = []
@@ -665,9 +742,10 @@ async def _execute_edit_immediate(
             details=f"Failed at edit {len(done) + 1} of {total}",
             via=via,
         )
-        await update.message.reply_text(
-            f"Edited {len(done)} of {total} before failing: {type(exc).__name__}: {exc}"
-        )
+        if not await _maybe_notify_reauth(update, exc):
+            await update.message.reply_text(
+                f"Edited {len(done)} of {total} before failing: {type(exc).__name__}: {exc}"
+            )
         return f"Partial: edited {len(done)} of {total}, then failed: {exc}"
 
     # Per-edit success audit.
@@ -797,6 +875,68 @@ async def _execute_undo_confirmed(update: Update, pending: dict[str, Any]) -> No
     await update.message.reply_text(details)
 
 
+# ---------------- Phase 3c: /reauth ----------------
+
+async def reauth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/reauth — generate a Google OAuth consent URL and await the code/URL.
+
+    Owner-only. Resets any prior in-flight re-auth state so the user can
+    always /reauth again to start fresh.
+    """
+    if not _is_authorized(update):
+        log.warning("Rejected /reauth from chat_id=%s", update.effective_chat.id)
+        return
+
+    chat_id = update.effective_chat.id
+    _reauth_pending.pop(chat_id, None)
+
+    try:
+        auth_url, flow = build_consent_url()
+    except Exception as exc:
+        log.exception("build_consent_url failed")
+        await update.message.reply_text(
+            f"Couldn't build the consent URL: {type(exc).__name__}: {exc}"
+        )
+        return
+
+    _reauth_pending[chat_id] = flow
+
+    await update.message.reply_text(
+        "Open this URL in Safari or Chrome — NOT Telegram's in-app browser "
+        "(long-press the link → \"Open externally\", or paste it into the "
+        "browser yourself).\n\n"
+        "On the consent screen, check ALL three permission boxes "
+        "(Calendar, Tasks, Docs) — unchecking any will fail the exchange.\n\n"
+        "After consent your browser will fail to load localhost. That's "
+        "expected. Copy the full URL from the address bar and paste it "
+        "back to me.\n\n"
+        f"{auth_url}"
+    )
+
+
+async def _handle_reauth_code(update: Update, text: str, chat_id: int) -> None:
+    """User pasted the OAuth code/URL after /reauth. Exchange for tokens."""
+    flow = _reauth_pending.get(chat_id)
+    if flow is None:
+        # Defensive — shouldn't happen because free_text checks membership.
+        await update.message.reply_text("No re-auth in progress. Send /reauth to start.")
+        return
+
+    try:
+        complete_consent(flow, text)
+    except Exception as exc:
+        log.exception("complete_consent failed")
+        # Keep _reauth_pending so the user can retry without re-issuing /reauth.
+        await update.message.reply_text(
+            f"Couldn't exchange that code: {type(exc).__name__}: {exc}\n"
+            "Try pasting again, or send /reauth to start over."
+        )
+        return
+
+    _reauth_pending.pop(chat_id, None)
+    await update.message.reply_text("Reauthorized. Token good for 7 more days.")
+
+
 # ---------------- Wiring ----------------
 
 def build_application() -> Application:
@@ -811,6 +951,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("brief", brief))
     app.add_handler(CommandHandler("review", review))
     app.add_handler(CommandHandler("undo", undo))
+    app.add_handler(CommandHandler("reauth", reauth))
 
     # Free-text intent handler — must come AFTER command handlers.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))
