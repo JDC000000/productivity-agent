@@ -22,10 +22,12 @@ Authorization model:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
 import tempfile
+import time
 from typing import Any
 
 from telegram import Update
@@ -60,7 +62,7 @@ from .intents.executor import execute_intent
 from .intents.parser import parse_intent
 from .intents.undo import describe_target, find_undoable_entry
 from .scheduler import schedule_jobs
-from .voice import transcribe
+from .voice import CONFIDENCE_MARGIN, CONFIDENCE_THRESHOLD, transcribe
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +88,42 @@ _pending_tool_results: dict[int, list[dict[str, Any]]] = {}
 # holds PKCE state (code_verifier) so the SAME instance must be reused for
 # fetch_token to succeed. Cleared on completion or on a fresh /reauth.
 _reauth_pending: dict[int, Any] = {}
+
+# Phase 2 (MUST): MEDIUM-tier voice action awaiting its 5s cancel window.
+# Keyed on chat_id. Each entry holds:
+#   text       : transcribed text to process if no cancel comes in
+#   confidence : the score; threaded into the eventual audit entry
+#   deadline   : monotonic-time deadline (informational; the asyncio task is
+#                the actual scheduler — deadline survives only for diagnostics)
+#   task       : the asyncio.Task running the 5s sleep + proceed; cancel this
+#                to abort.
+# Separate from _pending (undo y/n) and _reauth_pending — the cancel keywords
+# ("fix", "no", "cancel") for this state must not collide with /undo's yes/no.
+_voice_pending: dict[int, dict[str, Any]] = {}
+
+VOICE_CANCEL_WINDOW_SECONDS = 5
+_VOICE_CANCEL_WORDS = {"fix", "no", "nope", "cancel", "stop", "abort"}
+
+
+def _classify_voice_cancel(text: str) -> bool:
+    """True if `text` is a voice-window cancel command. Mirrors the
+    punctuation-tolerant shape of _classify_confirmation but scoped to the
+    cancel vocabulary."""
+    words = re.findall(r"[a-z']+", text.lower())
+    if not words or len(words) > 3:
+        return False
+    return words[0] in _VOICE_CANCEL_WORDS
+
+
+_FILLER_RE = re.compile(
+    r"^[.?!,\s]*(uh+|um+|hmm+|mhmm+|mhm+)?[.?!,\s]*$", re.IGNORECASE
+)
+
+
+def _is_filler_or_empty(text: str) -> bool:
+    """Phase 2 (MUST): treat empty / pure-punctuation / 'um'-only transcripts
+    as 'didn't catch any speech' — refuse without burning a parse call."""
+    return bool(_FILLER_RE.fullmatch(text or ""))
 
 _HISTORY_USER_TURNS = 10  # cap: keep the last N real-user turns + their assistant pairs
 
@@ -314,10 +352,34 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
     chat_id = update.effective_chat.id
 
-    # Phase 3c: re-auth code intake takes priority. If the stashed flow exists
-    # and the message looks like an OAuth code/URL, complete the handshake.
-    # If the message doesn't look like a code, fall through — the user can
-    # retry the paste, run /reauth again to reset, or just abandon.
+    # Phase 2 (MUST): MEDIUM-tier voice cancel window takes top priority. While
+    # an entry exists in _voice_pending, the cancel words abort, ANY other text
+    # supersedes (treats the original voice as abandoned) and is then processed
+    # normally.
+    if chat_id in _voice_pending:
+        if _classify_voice_cancel(text):
+            entry = _voice_pending.pop(chat_id)
+            task = entry.get("task")
+            if task is not None and not task.done():
+                task.cancel()
+            log_action(
+                user_input=entry["text"],
+                intent=None,
+                result="voice_canceled",
+                details={"transcript": entry["text"]},
+                via="voice",
+                transcription_confidence=entry["confidence"],
+            )
+            await update.message.reply_text("Cancelled. Re-send when ready.")
+            return
+        # Any other text supersedes the pending voice action.
+        _supersede_voice_pending(chat_id, reason="new_text")
+        # Fall through to handle this new text normally.
+
+    # Phase 3c: re-auth code intake. If the stashed flow exists and the message
+    # looks like an OAuth code/URL, complete the handshake. If the message
+    # doesn't look like a code, fall through — the user can retry the paste,
+    # run /reauth again to reset, or just abandon.
     if chat_id in _reauth_pending and _looks_like_oauth_code(text):
         await _handle_reauth_code(update, text, chat_id)
         return
@@ -326,7 +388,13 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Telegram voice note → faster-whisper transcript → same pipeline as free_text."""
+    """Telegram voice note → faster-whisper transcript → tier on confidence.
+
+    Phase 2 (MUST):
+      HIGH   (score >= THRESHOLD + MARGIN): no echo, process silently
+      MEDIUM (around THRESHOLD): "Heard: ... Acting in 5s — send 'fix'/'no' to abort"
+      LOW    (score < THRESHOLD - MARGIN): refuse, ask for resend
+    """
     if not _is_authorized(update):
         log.warning("Rejected voice from chat_id=%s", update.effective_chat.id)
         return
@@ -334,6 +402,12 @@ async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     voice = update.message.voice
     if voice is None:
         return  # MessageHandler(filters.VOICE) shouldn't deliver this, but guard anyway.
+
+    chat_id = update.effective_chat.id
+
+    # If a prior MEDIUM voice action is mid-window when a NEW voice note arrives,
+    # the new one supersedes the old (GUPPI — behavior implies abandonment).
+    _supersede_voice_pending(chat_id, reason="new_voice")
 
     try:
         await update.message.chat.send_action(ChatAction.TYPING)
@@ -346,7 +420,7 @@ async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         fd, tmp_path = tempfile.mkstemp(suffix=".ogg", prefix="ptb-voice-")
         os.close(fd)
         await tg_file.download_to_drive(tmp_path)
-        text = transcribe(tmp_path)
+        text, confidence = transcribe(tmp_path)
     except Exception as exc:
         log.exception("voice download/transcribe failed")
         await update.message.reply_text(
@@ -361,19 +435,106 @@ async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 log.warning("couldn't clean up temp voice file: %s", tmp_path)
 
     text = text.strip()
-    if not text:
-        await update.message.reply_text("Couldn't make out any speech in that clip.")
+
+    # Empty / pure-filler transcripts: refuse without burning a parse call.
+    if _is_filler_or_empty(text):
+        await update.message.reply_text("Didn't catch any speech. Try again.")
         return
 
-    # Echo the transcript so Jon can spot mistranscriptions before the action lands.
-    await update.message.reply_text(f"Heard: {text}")
+    high_cutoff = CONFIDENCE_THRESHOLD + CONFIDENCE_MARGIN
+    low_cutoff = CONFIDENCE_THRESHOLD - CONFIDENCE_MARGIN
 
-    chat_id = update.effective_chat.id
-    await _process_user_text(update, text, chat_id, via="voice")
+    if confidence >= high_cutoff:
+        # HIGH: process immediately, no echo. Same UX as Phase 5 for clean voice.
+        await _process_user_text(update, text, chat_id, via="voice", transcription_confidence=confidence)
+        return
+
+    if confidence < low_cutoff:
+        # LOW: refuse, log a friction-signal entry so Friday review counts it.
+        log_action(
+            user_input=text,
+            intent=None,
+            result="low_confidence",
+            details={"transcript": text, "confidence": confidence},
+            via="voice",
+            transcription_confidence=confidence,
+        )
+        await update.message.reply_text(
+            f"Couldn't catch that clearly: {text}\n"
+            "Send the action again or as text."
+        )
+        return
+
+    # MEDIUM: echo + start the 5s cancel window. Stash the task in
+    # _voice_pending; reply with the explicit prompt; user can send a cancel
+    # word, supersede with a new message, or wait out the timer.
+    task = asyncio.create_task(
+        _voice_pending_proceed(update, chat_id, text, confidence)
+    )
+    _voice_pending[chat_id] = {
+        "text": text,
+        "confidence": confidence,
+        "deadline": time.monotonic() + VOICE_CANCEL_WINDOW_SECONDS,
+        "task": task,
+    }
+    await update.message.reply_text(
+        f"Heard: {text}\n"
+        f"Acting in {VOICE_CANCEL_WINDOW_SECONDS}s — send 'fix' or 'no' to abort."
+    )
+
+
+async def _voice_pending_proceed(
+    update: Update, chat_id: int, text: str, confidence: float
+) -> None:
+    """The 5s sleep + process step for a MEDIUM-tier voice action. Cancellation
+    is via asyncio.Task.cancel() from the cancel-word handler or supersede path."""
+    try:
+        await asyncio.sleep(VOICE_CANCEL_WINDOW_SECONDS)
+    except asyncio.CancelledError:
+        return  # Caller already cleared _voice_pending and replied.
+
+    # Re-check state — a supersede might have happened during the sleep without
+    # cancelling us (race). If the entry is gone or its task is no longer us,
+    # bail.
+    entry = _voice_pending.get(chat_id)
+    if entry is None or entry.get("task") is not asyncio.current_task():
+        return
+    _voice_pending.pop(chat_id, None)
+
+    await _process_user_text(
+        update, text, chat_id, via="voice", transcription_confidence=confidence
+    )
+
+
+def _supersede_voice_pending(chat_id: int, reason: str) -> None:
+    """Cancel an in-flight voice cancel-window task without invoking the
+    proceed action. Audit-log a 'voice_superseded' entry so Friday review can
+    count abandoned partial-confidence voices."""
+    entry = _voice_pending.pop(chat_id, None)
+    if entry is None:
+        return
+    task = entry.get("task")
+    if task is not None and not task.done():
+        task.cancel()
+    try:
+        log_action(
+            user_input=entry["text"],
+            intent=None,
+            result="voice_superseded",
+            details={"reason": reason, "transcript": entry["text"]},
+            via="voice",
+            transcription_confidence=entry["confidence"],
+        )
+    except Exception:
+        log.exception("audit supersede failed")
 
 
 async def _process_user_text(
-    update: Update, text: str, chat_id: int, via: str
+    update: Update,
+    text: str,
+    chat_id: int,
+    via: str,
+    transcription_confidence: float | None = None,
 ) -> None:
     """Phase 5: conversational pipeline.
 
@@ -383,6 +544,9 @@ async def _process_user_text(
        (shape unchanged from Phase 3a–3i).
     4. Update history.
     5. Send Haiku's text_reply, or stay silent.
+
+    Phase 2 (MUST): when via="voice", transcription_confidence is threaded into
+    every per-tool audit entry so Friday review can bucket HIGH/MED/LOW.
     """
     # 1. Pending confirmation? (only /undo uses this after Phase 5)
     pending = _pending.get(chat_id)
@@ -445,7 +609,10 @@ async def _process_user_text(
         result = parse_intent(messages_for_api, creds=parser_creds)
     except Exception as exc:
         log.exception("parse failed")
-        log_action(user_input=text, intent=None, result="parse_error", error=str(exc), via=via)
+        log_action(
+            user_input=text, intent=None, result="parse_error", error=str(exc),
+            via=via, transcription_confidence=transcription_confidence,
+        )
         await update.message.reply_text(f"Couldn't parse that: {type(exc).__name__}: {exc}")
         return
 
@@ -457,7 +624,9 @@ async def _process_user_text(
     # Capture each tool's result string for the NEXT turn's tool_result blocks.
     new_tool_results: list[dict[str, Any]] = []
     for call in tool_calls:
-        result_str = await _dispatch_tool_call(update, text, via, call)
+        result_str = await _dispatch_tool_call(
+            update, text, via, call, transcription_confidence=transcription_confidence,
+        )
         new_tool_results.append({
             "type": "tool_result",
             "tool_use_id": call["id"],
@@ -480,7 +649,11 @@ async def _process_user_text(
 
 
 async def _dispatch_tool_call(
-    update: Update, original_text: str, via: str, call: dict[str, Any]
+    update: Update,
+    original_text: str,
+    via: str,
+    call: dict[str, Any],
+    transcription_confidence: float | None = None,
 ) -> str:
     """Phase 5: run one tool_use call from Haiku, write per-tool audits, and
     return a result string for the API tool_result block (so Haiku knows what
@@ -493,10 +666,14 @@ async def _dispatch_tool_call(
     name = call["name"]
 
     if name == "complete_task":
-        return await _execute_complete_immediate(update, original_text, call, via)
+        return await _execute_complete_immediate(
+            update, original_text, call, via, transcription_confidence=transcription_confidence,
+        )
 
     if name == "edit_task":
-        return await _execute_edit_immediate(update, original_text, call, via)
+        return await _execute_edit_immediate(
+            update, original_text, call, via, transcription_confidence=transcription_confidence,
+        )
 
     # add_task, append_to_brain_dump, query_brain_dump
     intent_shape = {"name": name, "input": call["input"]}
@@ -515,7 +692,7 @@ async def _dispatch_tool_call(
                     intent={"name": "add_task", "input": r["task_input"]},
                     result="ok",
                     details=r["summary_line"],
-                    via=via,
+                    via=via, transcription_confidence=transcription_confidence,
                     created_task_id=r.get("created_task_id"),
                     created_task_list_id=r.get("created_task_list_id"),
                 )
@@ -525,7 +702,7 @@ async def _dispatch_tool_call(
                 result="error",
                 error=str(exc),
                 details=f"Failed at task {len(done) + 1} of {total}",
-                via=via,
+                via=via, transcription_confidence=transcription_confidence,
             )
             await update.message.reply_text(
                 f"Added {len(done)} of {total} before failing: {type(exc).__name__}: {exc}"
@@ -533,7 +710,7 @@ async def _dispatch_tool_call(
             return f"Partial: added {len(done)} of {total}, then failed: {exc}"
         log_action(
             user_input=original_text, intent=intent_shape, result="error",
-            error=str(exc), via=via,
+            error=str(exc), via=via, transcription_confidence=transcription_confidence,
         )
         if not await _maybe_notify_reauth(update, exc):
             await update.message.reply_text(f"Failed: {type(exc).__name__}: {exc}")
@@ -547,7 +724,7 @@ async def _dispatch_tool_call(
                 intent={"name": "add_task", "input": r["task_input"]},
                 result="ok",
                 details=r["summary_line"],
-                via=via,
+                via=via, transcription_confidence=transcription_confidence,
                 created_task_id=r.get("created_task_id"),
                 created_task_list_id=r.get("created_task_list_id"),
             )
@@ -556,14 +733,18 @@ async def _dispatch_tool_call(
         audit_details = intent_shape.get("_audit_summary") or result_msg
         log_action(
             user_input=original_text, intent=intent_shape, result="ok",
-            details=audit_details, via=via,
+            details=audit_details, via=via, transcription_confidence=transcription_confidence,
         )
 
     return result_msg
 
 
 async def _execute_complete_immediate(
-    update: Update, original_text: str, call: dict[str, Any], via: str
+    update: Update,
+    original_text: str,
+    call: dict[str, Any],
+    via: str,
+    transcription_confidence: float | None = None,
 ) -> str:
     """Phase 5: complete_task fires immediately, no yes/no staging.
 
@@ -609,7 +790,7 @@ async def _execute_complete_immediate(
             intent={"name": "complete_task", "input": call["input"]},
             result="no_match",
             details={"unmatched": unmatched},
-            via=via,
+            via=via, transcription_confidence=transcription_confidence,
         )
         bullets = "\n".join(f"  • {q}" for q in unmatched)
         await update.message.reply_text(f"No open task matched:\n{bullets}")
@@ -626,7 +807,7 @@ async def _execute_complete_immediate(
         log.exception("complete_task execute failed")
         log_action(
             user_input=original_text, intent=intent_with_matches,
-            result="error", error=str(exc), via=via,
+            result="error", error=str(exc), via=via, transcription_confidence=transcription_confidence,
         )
         if not await _maybe_notify_reauth(update, exc):
             await update.message.reply_text(f"Failed: {type(exc).__name__}: {exc}")
@@ -644,7 +825,7 @@ async def _execute_complete_immediate(
             },
             result="ok",
             details=f"Completed: {m.get('title', '(untitled)')}",
-            via=via,
+            via=via, transcription_confidence=transcription_confidence,
         )
 
     # Audit unmatched queries separately so Friday review counts each.
@@ -654,14 +835,18 @@ async def _execute_complete_immediate(
             intent={"name": "complete_task", "input": {"title_query": q}},
             result="no_match",
             details=f"unmatched: {q!r}",
-            via=via,
+            via=via, transcription_confidence=transcription_confidence,
         )
 
     return result_msg
 
 
 async def _execute_edit_immediate(
-    update: Update, original_text: str, call: dict[str, Any], via: str
+    update: Update,
+    original_text: str,
+    call: dict[str, Any],
+    via: str,
+    transcription_confidence: float | None = None,
 ) -> str:
     """Phase 3g+5: edit_task fires immediately. No bot reply on success — Haiku
     composes the user-facing message. Per-edit audit + before_state preserved.
@@ -701,7 +886,7 @@ async def _execute_edit_immediate(
             intent={"name": "edit_task", "input": call["input"]},
             result="no_match",
             details={"unmatched": unmatched},
-            via=via,
+            via=via, transcription_confidence=transcription_confidence,
         )
         bullets = "\n".join(f"  • {q}" for q in unmatched)
         await update.message.reply_text(f"No open task matched:\n{bullets}")
@@ -731,7 +916,7 @@ async def _execute_edit_immediate(
                 },
                 result="ok",
                 details=r["summary_line"],
-                via=via,
+                via=via, transcription_confidence=transcription_confidence,
                 before_state=r["before_state"],
             )
         log_action(
@@ -740,7 +925,7 @@ async def _execute_edit_immediate(
             result="error",
             error=str(exc),
             details=f"Failed at edit {len(done) + 1} of {total}",
-            via=via,
+            via=via, transcription_confidence=transcription_confidence,
         )
         if not await _maybe_notify_reauth(update, exc):
             await update.message.reply_text(
@@ -760,7 +945,7 @@ async def _execute_edit_immediate(
             },
             result="ok",
             details=r["summary_line"],
-            via=via,
+            via=via, transcription_confidence=transcription_confidence,
             before_state=r["before_state"],
         )
     for q in unmatched:
@@ -769,7 +954,7 @@ async def _execute_edit_immediate(
             intent={"name": "edit_task", "input": {"target_query": q}},
             result="no_match",
             details=f"unmatched: {q!r}",
-            via=via,
+            via=via, transcription_confidence=transcription_confidence,
         )
 
     return result_msg

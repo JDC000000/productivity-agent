@@ -23,6 +23,7 @@ def log_action(
     created_task_list_id: str | None = None,
     undid_ts: str | None = None,
     before_state: dict[str, Any] | None = None,
+    transcription_confidence: float | None = None,
 ) -> None:
     """Append one record to actions.jsonl. Best-effort — doesn't raise if logging fails.
 
@@ -38,6 +39,10 @@ def log_action(
     Phase 3g optional field:
       before_state : pre-edit values for whichever task fields the edit_task
         intent changed. Stashed for a future /undo on edits (Phase 3j).
+
+    Phase 2 (MUST) optional field:
+      transcription_confidence : duration-weighted exp(avg_logprob) in [0, 1]
+        for voice-originated turns. Friday review can bucket HIGH/MED/LOW.
     """
     ACTIONS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     record: dict[str, Any] = {
@@ -59,6 +64,8 @@ def log_action(
         record["undid_ts"] = undid_ts
     if before_state is not None:
         record["before_state"] = before_state
+    if transcription_confidence is not None:
+        record["transcription_confidence"] = transcription_confidence
 
     try:
         with ACTIONS_LOG_PATH.open("a") as f:
